@@ -28,6 +28,38 @@ This code accompanies a paper submitted to **ICPR 2026**.
 
 ---
 
+## 📊 Data
+
+This repository relies on publicly available DAS datasets.  
+**Raw data are not included** and must be downloaded separately.
+
+### Dataset 1 — Laboratory φ-OTDR Dataset
+- Source: Beijing Jiaotong University (BJTUSensor)
+- Link: https://github.com/BJTUSensor/
+- Description: Controlled laboratory φ-OTDR experiments with **6 event classes** (standard intrusion events) .
+  - background
+  - car
+  - digging
+  - knocking
+  - shaking
+  - watering
+  - walking
+   
+
+### Dataset 2 — Real-Scenario Campus DAS Dataset
+- Source: Tomasov *et al.* (Figshare)
+- DOI: https://doi.org/10.6084/m9.figshare.27004732
+- Description: Real-world φ-OTDR dataset with **9 event classes**:
+  - car
+  - fence
+  - longboard
+  - manipulation
+  - open / close
+  - construction
+  - regular
+  - running
+  - walking
+
 ## 🏗 Repository Structure
 
 DAStatFormer/
