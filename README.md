@@ -3,7 +3,7 @@
 
 ---
 
-## 📌 Overview
+## Overview
 
 This repository contains the official PyTorch implementation of **DAStatFormer**, a hybrid Transformer-based framework for **event recognition from Distributed Acoustic Sensing (DAS) data**.
 
@@ -18,7 +18,7 @@ This code accompanies a paper submitted to **ICPR 2026**.
 
 ---
 
-## 🔍 Key Contributions
+## Key Contributions
 
 - Statistical feature-driven Transformer for DAS, avoiding raw high-dimensional signal processing  
 - 24 ANOVA-selected interpretable features per channel, reducing data size by orders of magnitude  
@@ -28,7 +28,7 @@ This code accompanies a paper submitted to **ICPR 2026**.
 
 ---
 
-## 📊 Data
+## Data
 
 This repository relies on publicly available DAS datasets.  
 **Raw data are not included** and must be downloaded separately.
@@ -60,7 +60,7 @@ This repository relies on publicly available DAS datasets.
   - walking
 
 
-## 🏗 Repository Structure
+## Repository Structure
 
 ```text
 DAStatFormer/
