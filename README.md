@@ -74,6 +74,6 @@ DAStatFormer/
 │   ├── random_seed.py         # Reproducibility utilities
 │   └── visualization.py       # Training curves & confusion matrices
 ├── feature_extraction.py      # 24 statistical feature extraction
-├── train.py                   # Main training and evaluation script
+├── DAStatFormer.py                   # Main training and evaluation script
 ├── requirements.txt
 └── README.md
