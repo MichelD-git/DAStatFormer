@@ -38,7 +38,6 @@ This repository relies on publicly available DAS datasets.
 - Link: https://github.com/BJTUSensor/
 - Description: Controlled laboratory φ-OTDR experiments with **6 event classes** (standard intrusion events) .
   - background
-  - car
   - digging
   - knocking
   - shaking
