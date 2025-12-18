@@ -60,19 +60,21 @@ This repository relies on publicly available DAS datasets.
   - running
   - walking
 
+
 ## 🏗 Repository Structure
 
+```text
 DAStatFormer/
 ├── dataset_process/
-│ └── dataset_process.py # Dataset loading and preprocessing
+│   └── dataset_process.py     # Dataset loading and preprocessing
 ├── module/
-│ ├── encoder.py # Transformer encoder (MHA + FFN)
-│ ├── loss.py # Loss functions
-│ └── attention.py # Multi-head attention modules
+│   ├── encoder.py             # Transformer encoder (MHA + FFN)
+│   ├── attention.py           # Multi-head attention modules
+│   └── loss.py                # Loss functions
 ├── utils/
-│ ├── random_seed.py # Reproducibility utilities
-│ └── visualization.py # Training curves & confusion matrices
-├── train.py # Main training and evaluation script
-├── feature_extraction.py # 24 statistical feature extraction
+│   ├── random_seed.py         # Reproducibility utilities
+│   └── visualization.py       # Training curves & confusion matrices
+├── feature_extraction.py      # 24 statistical feature extraction
+├── train.py                   # Main training and evaluation script
 ├── requirements.txt
 └── README.md
