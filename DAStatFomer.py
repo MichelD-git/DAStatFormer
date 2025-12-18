@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+
+"""
+Created on Fri Oct 10 11:11:09 2025
+
+@author: michel
+"""
+
 """
 GTN 3 branches (time / waveform / spectral)
 Entrée attendue: x (B, L, F) avec F=24
@@ -310,16 +317,6 @@ mask = True  # (utilisé dans les Encoders)
 optimizer_name = 'Adam'
 
 # # ====== Data ======
-# train_dataset = MyDataset(path_mat, 'train')
-# test_dataset  = MyDataset(path_mat, 'test')
-# train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-# test_dataloader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False)
-
-# DATA_LEN = train_dataset.train_len
-# d_input  = train_dataset.input_len   # L
-# d_channel = train_dataset.channel_len # F
-# d_output = train_dataset.output_len
-
 
 from torch.utils.data import random_split, DataLoader
 
@@ -501,13 +498,13 @@ def train():
         print(f"[rename failed] {e}")
 
     time_cost = round((time() - begin) / 60, 2)
-    print(f"\n⏱️ Training completed in {time_cost} min.")
+    print(f"\nTraining completed in {time_cost} min.")
 
     if torch.cuda.is_available():
         max_alloc = torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2
         max_reserv = torch.cuda.max_memory_reserved(DEVICE) / 1024 ** 2
-        print(f"📈 Max GPU Memory Allocated: {max_alloc:.2f} MB")
-        print(f"📦 Max GPU Memory Reserved : {max_reserv:.2f} MB")
+        print(f"Max GPU Memory Allocated: {max_alloc:.2f} MB")
+        print(f"Max GPU Memory Reserved : {max_reserv:.2f} MB")
 
     # Courbes finales
     try:
@@ -577,8 +574,8 @@ def measure_inference_time(model, dataloader, device, n_warmup=5):
     avg_time_per_batch = total_time / len(times)
     avg_time_per_sample = (total_time / total_samples) * 1000  # en ms
 
-    print(f"\n⚡ Inference time per batch:   {avg_time_per_batch:.4f} s")
-    print(f"⚡ Inference time per sample: {avg_time_per_sample:.4f} ms\n")
+    print(f"\n Inference time per batch:   {avg_time_per_batch:.4f} s")
+    print(f" Inference time per sample: {avg_time_per_sample:.4f} ms\n")
 
     return avg_time_per_sample
 
