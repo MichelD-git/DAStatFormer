@@ -1,0 +1,14 @@
+
+---
+
+## Requirements
+
+- Python ≥ 3.8  
+- PyTorch ≥ 1.12  
+- NumPy, SciPy   
+- matplotlib, seaborn  
+
+Install dependencies with:
+
+```bash
+pip install -r requirements.txt
