@@ -34,7 +34,7 @@ This repository relies on publicly available DAS datasets.
 **Raw data are not included** and must be downloaded separately.
 
 ### Dataset 1 — Laboratory φ-OTDR Dataset
-- Source: Beijing Jiaotong University (BJTUSensor)
+- Source: Xiaomin Cao et al. Beijing Jiaotong University (BJTUSensor)
 - Link: https://github.com/BJTUSensor/
 - Description: Controlled laboratory φ-OTDR experiments with **6 event classes** (standard intrusion events) .
   - background
