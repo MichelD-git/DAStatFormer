@@ -8,12 +8,11 @@ Created on Fri Oct 10 11:11:09 2025
 
 """
 GTN 3 branches (time / waveform / spectral)
-Entrée attendue: x (B, L, F) avec F=24
-Le wrapper découpe:
+Input x (B, L, F) avec F=24
+wrapper :
   - time : 0:7 -> 7
   - wave : 7:13 -> 6
   - spec : 13:24 -> 11
-Entraînement avec logs par EPOCH uniquement.
 """
 
 import os
