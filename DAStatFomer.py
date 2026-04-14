@@ -18,47 +18,183 @@ Entraînement avec logs par EPOCH uniquement.
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# ====== Imports ======
 import math
+import time as tm
+from time import time
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 import torch.optim as optim
-
-import numpy as np
 import pandas as pd
-import seaborn as sns
 import matplotlib.pyplot as plt
+import seaborn as sns
 
-from time import time
-from pathlib import Path
-from sklearn.metrics import confusion_matrix
+from tqdm import tqdm
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+from torch.utils.data import DataLoader, random_split, Dataset
 
-# vos modules
 from dataset_process.dataset_process import MyDataset
-from module.loss import Myloss
 from utils.random_seed import setup_seed
 from utils.visualization import result_visualization
-
-try:
-    from module.encoder import EncoderV2 as EncoderUsed
-except Exception:
-    from module.encoder import Encoder as EncoderUsed
+from module.feedForward import FeedForward
+from module.encoder import Encoder
 
 
-# ====== GTN: 1 branche ======
+# =========================================================
+# MultiHeadAttention
+# =========================================================
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, q: int, v: int, h: int, device: str,
+                 mask: bool = False, dropout: float = 0.1):
+        super().__init__()
+        self.W_q = nn.Linear(d_model, q * h)
+        self.W_k = nn.Linear(d_model, q * h)
+        self.W_v = nn.Linear(d_model, v * h)
+        self.W_o = nn.Linear(v * h, d_model)
+
+        self.device = device
+        self._h = h
+        self._q = q
+        self.mask = mask
+        self.dropout = nn.Dropout(p=dropout)
+        self.score = None
+
+    def forward(self, q_in, kv_in=None, stage='train'):
+        if kv_in is None:
+            kv_in = q_in
+
+        Q = torch.cat(self.W_q(q_in).chunk(self._h, dim=-1), dim=0)
+        K = torch.cat(self.W_k(kv_in).chunk(self._h, dim=-1), dim=0)
+        V = torch.cat(self.W_v(kv_in).chunk(self._h, dim=-1), dim=0)
+
+        score = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self._q)
+        self.score = score
+
+        if self.mask and (kv_in is q_in) and stage == 'train':
+            mask = torch.ones_like(score[0])
+            mask = torch.tril(mask, diagonal=0)
+            score = torch.where(
+                mask > 0, score,
+                torch.tensor([-2**32 + 1], device=self.device).expand_as(score[0])
+            )
+
+        score = F.softmax(score, dim=-1)
+        score = self.dropout(score)
+
+        attention = torch.matmul(score, V)
+        attention_heads = torch.cat(attention.chunk(self._h, dim=0), dim=-1)
+        out = self.W_o(attention_heads)
+
+        return out, self.score
+
+
+# =========================================================
+# CrossEncoder
+# =========================================================
+class CrossEncoder(nn.Module):
+    def __init__(self, d_model: int, d_hidden: int, q: int, v: int, h: int,
+                 device: str, dropout: float = 0.1):
+        super().__init__()
+
+        self.cross_mha = MultiHeadAttention(
+            d_model=d_model,
+            q=q,
+            v=v,
+            h=h,
+            mask=False,
+            device=device,
+            dropout=dropout
+        )
+
+        self.feedforward = FeedForward(
+            d_model=d_model,
+            d_hidden=d_hidden
+        )
+
+        self.dropout = nn.Dropout(p=dropout)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+
+    def forward(self, q_x, kv_x, stage):
+        residual = q_x
+        q_x_norm = self.ln1(q_x)
+        out, score = self.cross_mha(q_x_norm, kv_x, stage=stage)
+        q_x = residual + self.dropout(out)
+
+        residual = q_x
+        q_x_norm = self.ln2(q_x)
+        out = self.feedforward(q_x_norm)
+        q_x = residual + self.dropout(out)
+
+        return q_x, score
+
+
+# =========================================================
+# Dataset wrapper : split des 24 features
+# =========================================================
+class MyDataset3Domains(Dataset):
+    def __init__(self, path, split):
+        self.base = MyDataset(path, split)
+
+        self.input_len = self.base.input_len
+        self.output_len = self.base.output_len
+
+        self.time_dim = 7
+        self.wave_dim = 6
+        self.spec_dim = 11
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        x, y = self.base[idx]
+
+        # On force tensor float
+        if not torch.is_tensor(x):
+            x = torch.tensor(x, dtype=torch.float32)
+        else:
+            x = x.float()
+
+        if not torch.is_tensor(y):
+            y = torch.tensor(y, dtype=torch.long)
+        else:
+            y = y.long()
+
+        if x.ndim != 2:
+            raise ValueError(f"Entrée attendue 2D, reçu {tuple(x.shape)}")
+
+        # Cas 1 : x = (L, 24)
+        if x.shape[1] == 24:
+            x_lf = x
+
+        # Cas 2 : x = (24, L)  --> on transpose
+        elif x.shape[0] == 24:
+            x_lf = x.transpose(0, 1)
+
+        else:
+            raise ValueError(
+                f"Impossible de trouver l'axe des 24 features. "
+                f"Shape reçue : {tuple(x.shape)}"
+            )
+
+        # x_lf = (L, 24)
+        x_time = x_lf[:, 0:7]
+        x_wave = x_lf[:, 7:13]
+        x_spec = x_lf[:, 13:24]
+
+        return x_time, x_wave, x_spec, y
+
+
+# =========================================================
+# Une branche GTN
+# =========================================================
 class GTNBranch(nn.Module):
-    """
-    Une branche GTN:
-      - embedding "step-wise": Linear(d_attr -> d_model) sur l'axe des features
-      - embedding "channel-wise": Linear(L -> d_model) sur l'axe temporel
-      - 2 piles d'encodeurs (step & chan)
-      - gate 2-voies (step vs chan)
-      - sortie vectorisée concat(step_flat, chan_flat) après pondération par la gate
-    """
-    def __init__(self, d_attr, d_input_L, d_model, d_hidden, q, v, h, N, dropout, device, pe=True, name="branch"):
+    def __init__(self, d_attr, d_input_L, d_model, d_hidden, q, v, h, N,
+                 dropout, device, pe=True, mask=False, name="branch"):
         super().__init__()
         self.name = name
         self.L = d_input_L
@@ -66,25 +202,41 @@ class GTNBranch(nn.Module):
         self.d_model = d_model
         self.pe = pe
 
-        self.embedding_step = nn.Linear(d_attr, d_model)     # (B,L,d_attr)->(B,L,d_model)
-        self.embedding_chan = nn.Linear(self.L, d_model)      # (B,d_attr,L)->(B,d_attr,d_model)
+        # step-wise: (B, L, d_attr) -> (B, L, d_model)
+        self.embedding_step = nn.Linear(d_attr, d_model)
+
+        # channel-wise/domain-wise: (B, d_attr, L) -> (B, d_attr, d_model)
+        self.embedding_chan = nn.Linear(self.L, d_model)
 
         self.encoder_list_step = nn.ModuleList([
-            EncoderUsed(d_model=d_model, d_hidden=d_hidden, q=q, v=v, h=h, dropout=dropout, device=device)
+            Encoder(d_model=d_model, d_hidden=d_hidden, q=q, v=v, h=h,
+                    mask=mask, dropout=dropout, device=device)
             for _ in range(N)
         ])
+
         self.encoder_list_chan = nn.ModuleList([
-            EncoderUsed(d_model=d_model, d_hidden=d_hidden, q=q, v=v, h=h, dropout=dropout, device=device)
+            Encoder(d_model=d_model, d_hidden=d_hidden, q=q, v=v, h=h,
+                    mask=False, dropout=dropout, device=device)
             for _ in range(N)
         ])
+
+        self.cross_step_to_chan = CrossEncoder(
+            d_model=d_model, d_hidden=d_hidden, q=q, v=v, h=h,
+            device=device, dropout=dropout
+        )
+        self.cross_chan_to_step = CrossEncoder(
+            d_model=d_model, d_hidden=d_hidden, q=q, v=v, h=h,
+            device=device, dropout=dropout
+        )
 
         fused_in_dim = d_model * self.L + d_model * d_attr
         self.gate = nn.Linear(fused_in_dim, 2)
 
-    def _add_pe(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_pe(self, x):
         if not self.pe:
             return x
-        B, L, D = x.shape
+
+        _, L, D = x.shape
         device = x.device
         pe = torch.zeros(L, D, device=device)
         pos = torch.arange(0, L, dtype=torch.float32, device=device).unsqueeze(1)
@@ -93,442 +245,372 @@ class GTNBranch(nn.Module):
         pe[:, 1::2] = torch.cos(pos * div)
         return x + pe.unsqueeze(0)
 
-    def forward(self, x: torch.Tensor, stage: str):
-        # x: (B, L, d_attr)
-        # step-wise
+    def forward(self, x, stage):
+        # x : (B, L, d_attr)
+
+        # -------- Step-wise --------
         step_seq = self.embedding_step(x)
         step_seq = self._add_pe(step_seq)
+
         score_step = None
         for enc in self.encoder_list_step:
-            step_seq, score_step = enc(step_seq, stage)   # (B,L,d_model)
+            step_seq, score_step = enc(step_seq, stage)
 
-        # channel-wise
-        chan_seq = self.embedding_chan(x.transpose(-1, -2))   # (B,d_attr,d_model)
+        # -------- Channel/domain-wise --------
+        chan_seq = self.embedding_chan(x.transpose(-1, -2))  # (B, d_attr, L) -> (B, d_attr, d_model)
+
         score_chan = None
         for enc in self.encoder_list_chan:
             chan_seq, score_chan = enc(chan_seq, stage)
 
-        # flatten + gate
+        # -------- Cross-attention bidirectionnelle --------
+        step_seq, score_cross_s2c = self.cross_step_to_chan(step_seq, chan_seq, stage)
+        chan_seq, score_cross_c2s = self.cross_chan_to_step(chan_seq, step_seq, stage)
+
+        # -------- Flatten + gate --------
         step_flat = step_seq.reshape(step_seq.size(0), -1)
         chan_flat = chan_seq.reshape(chan_seq.size(0), -1)
-        gate = F.softmax(self.gate(torch.cat([step_flat, chan_flat], dim=-1)), dim=-1)  # (B,2)
 
-        fused_branch = torch.cat([step_flat * gate[:, 0:1], chan_flat * gate[:, 1:2]], dim=-1)
-        return fused_branch, gate, step_seq, chan_seq, score_step, score_chan
+        gate = F.softmax(self.gate(torch.cat([step_flat, chan_flat], dim=-1)), dim=-1)
+
+        fused_branch = torch.cat([
+            step_flat * gate[:, 0:1],
+            chan_flat * gate[:, 1:2]
+        ], dim=-1)
+
+        return (
+            fused_branch, gate,
+            step_seq, chan_seq,
+            score_step, score_chan,
+            score_cross_s2c, score_cross_c2s
+        )
 
 
-# ====== GTN: 3 branches parallèles + fusion ======
-class GTNParallel3(nn.Module):
-    """
-    forward(x_time, x_wave, x_spec, stage)
-      x_* : (B, L, d_attr_*)
-    Sortie: (logits, fused_all, scores_step_list, scores_chan_list, seqs_step_list, seqs_chan_list, gates_list)
-    """
+# =========================================================
+# Modèle 3 branches
+# =========================================================
+class GTNParallel3Domains(nn.Module):
     def __init__(self, d_temp, d_wave, d_spec, d_input_L,
                  d_model, d_hidden, q, v, h, N, dropout, device,
-                 d_output, pe=True):
+                 d_output, pe=True, mask=False):
         super().__init__()
-        self.d_output = d_output
 
-        self.branch_time = GTNBranch(d_attr=d_temp, d_input_L=d_input_L,
-                                     d_model=d_model, d_hidden=d_hidden,
-                                     q=q, v=v, h=h, N=N, dropout=dropout,
-                                     device=device, pe=pe, name="time")
+        self.branch_time = GTNBranch(
+            d_attr=d_temp,
+            d_input_L=d_input_L,
+            d_model=d_model,
+            d_hidden=d_hidden,
+            q=q, v=v, h=h, N=N,
+            dropout=dropout,
+            device=device,
+            pe=pe,
+            mask=mask,
+            name="time"
+        )
 
-        self.branch_wave = GTNBranch(d_attr=d_wave, d_input_L=d_input_L,
-                                     d_model=d_model, d_hidden=d_hidden,
-                                     q=q, v=v, h=h, N=N, dropout=dropout,
-                                     device=device, pe=pe, name="wave")
+        self.branch_wave = GTNBranch(
+            d_attr=d_wave,
+            d_input_L=d_input_L,
+            d_model=d_model,
+            d_hidden=d_hidden,
+            q=q, v=v, h=h, N=N,
+            dropout=dropout,
+            device=device,
+            pe=pe,
+            mask=mask,
+            name="wave"
+        )
 
-        self.branch_spec = GTNBranch(d_attr=d_spec, d_input_L=d_input_L,
-                                     d_model=d_model, d_hidden=d_hidden,
-                                     q=q, v=v, h=h, N=N, dropout=dropout,
-                                     device=device, pe=pe, name="spec")
+        self.branch_spec = GTNBranch(
+            d_attr=d_spec,
+            d_input_L=d_input_L,
+            d_model=d_model,
+            d_hidden=d_hidden,
+            q=q, v=v, h=h, N=N,
+            dropout=dropout,
+            device=device,
+            pe=pe,
+            mask=mask,
+            name="spec"
+        )
 
-        fused_dim = d_model * (d_input_L + d_temp) \
-                  + d_model * (d_input_L + d_wave) \
-                  + d_model * (d_input_L + d_spec)
+        fused_dim = (
+            d_model * (d_input_L + d_temp) +
+            d_model * (d_input_L + d_wave) +
+            d_model * (d_input_L + d_spec)
+        )
+
         self.output_layer = nn.Linear(fused_dim, d_output)
 
-    def forward(self, x_time, x_wave, x_spec, stage: str):
-        t_fused, t_gate, t_step, t_chan, t_s_step, t_s_chan = self.branch_time(x_time, stage)
-        w_fused, w_gate, w_step, w_chan, w_s_step, w_s_chan = self.branch_wave(x_wave, stage)
-        s_fused, s_gate, s_step, s_chan, s_s_step, s_s_chan = self.branch_spec(x_spec, stage)
+    def forward(self, x_time, x_wave, x_spec, stage):
+        out_t = self.branch_time(x_time, stage)
+        out_w = self.branch_wave(x_wave, stage)
+        out_s = self.branch_spec(x_spec, stage)
+
+        t_fused, t_gate = out_t[0], out_t[1]
+        w_fused, w_gate = out_w[0], out_w[1]
+        s_fused, s_gate = out_s[0], out_s[1]
 
         fused_all = torch.cat([t_fused, w_fused, s_fused], dim=-1)
         logits = self.output_layer(fused_all)
-        gates_list = [t_gate, w_gate, s_gate]
-        scores_step_list = [t_s_step, w_s_step, s_s_step]
-        scores_chan_list = [t_s_chan, w_s_chan, s_s_chan]
-        seqs_step_list   = [t_step,   w_step,   s_step]
-        seqs_chan_list   = [t_chan,   w_chan,   s_chan]
-        return (logits, fused_all, scores_step_list, scores_chan_list,
-                seqs_step_list, seqs_chan_list, gates_list)
+
+        return logits, fused_all, out_t, out_w, out_s
 
 
-# ====== Wrapper : découpe x_full (B,L,F) -> 3 domaines RAW+DIFF ======
-class DASDomainWrapper(nn.Module):
-    """
-    Par défaut (RAW+DIFF, F=48):
-      time: 0:11 + 24:35 (22), waveform: 11:19 + 35:43 (16), spectral: 19:24 + 43:48 (10)
-    """
-    def __init__(self, core_3branch: GTNParallel3,
-                 time_idx=(0,7), wave_idx=(7,13), spec_idx=(13,24),
-                 diff_offset=24, use_diff=True):
-        super().__init__()
-        self.core = core_3branch
-        self.t0, self.t1 = time_idx
-        self.w0, self.w1 = wave_idx
-        self.s0, self.s1 = spec_idx
-        self.diff_offset = diff_offset
-        self.use_diff = use_diff
-
-    def _slice(self, x, a, b):
-        raw = x[:, :, a:b]
-        if self.use_diff:
-            diff = x[:, :, self.diff_offset + a : self.diff_offset + b]
-            return torch.cat([raw, diff], dim=-1)
-        return raw
-
-    def forward(self, x_full, stage: str):
-        # On veut toujours (B, L, F) avec F = nb de features (time/wave/spec)
-        # Si la dernière dim est plus petite que la précédente, on transpose
-        if x_full.dim() == 3 and x_full.shape[2] < x_full.shape[1]:
-            x_full = x_full.transpose(1, 2)   # ex: (B,24,12) -> (B,12,24)
-    
-        x_time = self._slice(x_full, self.t0, self.t1)
-        x_wave = self._slice(x_full, self.w0, self.w1)
-        x_spec = self._slice(x_full, self.s0, self.s1)
-    
-        return self.core(x_time, x_wave, x_spec, stage)
-
-
-
-# ====== Plots ======
-def draw_loss_acc(train_acc, train_loss, val_acc, val_loss, out_png: str) -> None:
-    import numpy as np
-    os.makedirs(os.path.dirname(out_png), exist_ok=True)
-
-    n = min(len(train_acc), len(val_acc), len(train_loss), len(val_loss))
-    train_acc, val_acc   = list(train_acc[:n]), list(val_acc[:n])
-    train_loss, val_loss = list(train_loss[:n]), list(val_loss[:n])
-    epochs = range(n)
-
-    plt.figure(figsize=(8, 8))
-    # ACC
-    plt.subplot(2,1,1)
-    plt.plot(epochs, train_acc, label="train", linewidth=1.5)
-    plt.plot(epochs, val_acc,   label="val",   linewidth=1.5)
-    plt.title('Accuracy vs. epochs'); plt.ylabel('Accuracy'); plt.ylim(0.0, 1.0)
-    plt.grid(True, alpha=0.3); plt.legend(loc='upper left')
-    # LOSS
-    plt.subplot(2,1,2)
-    plt.plot(epochs, train_loss, label="train", linewidth=1.5)
-    plt.plot(epochs, val_loss,   label="val",   linewidth=1.5)
-    plt.xlabel('Epochs'); plt.ylabel('Loss')
-    ymax = max(1.0, max(train_loss + val_loss)) * 1.05
-    plt.ylim(0.0, ymax); plt.grid(True, alpha=0.3); plt.legend(loc='upper left')
-    plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.show(); plt.close()
-
-
-def evaluate_and_plot_confusion_matrix(model, dataloader, device, class_labels, save_path, file_name):
-    all_preds, all_labels = [], []
-    model.eval()
-    with torch.no_grad():
-        for x, y in dataloader:
-            x, y = x.to(device), y.to(device)
-            logits, *_ = model(x, 'test')
-            preds = logits.argmax(dim=1).cpu().numpy()
-            labels = y.cpu().numpy()
-            all_preds.extend(preds); all_labels.extend(labels)
-
-    C = confusion_matrix(all_labels, all_preds)
-    df = pd.DataFrame(C)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(df, fmt='g', annot=True, cmap='Reds',
-                xticklabels=class_labels, yticklabels=class_labels,
-                annot_kws={"size": 12})
-    plt.xlabel('Predicted label', fontsize=14)
-    plt.ylabel('True label', fontsize=14)
-    plt.xticks(rotation=0, fontsize=12)
-    plt.yticks(rotation=90, fontsize=12)
-    plt.tight_layout()
-    os.makedirs(save_path, exist_ok=True)
-    plt.savefig(f'{save_path}/{file_name}_Conf_Max.png')
-    plt.show(); plt.close()
-
-    print("\n===== Performance Metrics =====")
-    acc = np.trace(C) / np.sum(C); print('Accuracy: %.4f' % acc)
-    NAR = (np.sum(C[0]) - C[0][0]) / np.sum(C[:, 1:]) if C.shape[1] > 1 else 0.0
-    print('NAR: %.4f' % NAR)
-    FNR = (np.sum(C[:, 0]) - C[0][0]) / np.sum(C[1:]) if C.shape[0] > 1 else 0.0
-    print('FNR: %.4f' % FNR)
-    column_sum = np.sum(C, axis=0); row_sum = np.sum(C, axis=1)
-    print('Column sums:', column_sum); print('Row sums:', row_sum)
-    for i in range(len(class_labels)):
-        TP = C[i][i]
-        precision = TP / column_sum[i] if column_sum[i] != 0 else 0.0
-        recall = TP / row_sum[i] if row_sum[i] != 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) != 0 else 0.0
-        print(f'Precision_{i}: {precision:.3f}')
-        print(f'Recall_{i}:    {recall:.3f}')
-        print(f'F1_{i}:        {f1:.3f}')
-
-
+# =========================================================
+# Eval functions
+# =========================================================
 def evaluate_loss_acc(model, dataloader, device, criterion, desc="valid"):
     model.eval()
     total_loss, total_correct, total_count = 0.0, 0, 0
+
     with torch.no_grad():
-        for x, y in dataloader:
-            x, y = x.to(device), y.to(device)
-            logits, *_ = model(x, 'test')
+        for x_time, x_wave, x_spec, y in dataloader:
+            x_time = x_time.to(device)
+            x_wave = x_wave.to(device)
+            x_spec = x_spec.to(device)
+            y = y.to(device)
+
+            logits, *_ = model(x_time, x_wave, x_spec, 'test')
             loss = criterion(logits, y)
+
             total_loss += loss.item() * y.size(0)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_count += y.size(0)
+
     mean_loss = total_loss / max(total_count, 1)
     acc = 100.0 * total_correct / max(total_count, 1)
     print(f"{desc}: loss={mean_loss:.4f} | acc={acc:.2f}%")
     return mean_loss, acc
 
 
-# ====== Main config ======
-setup_seed(30)
-reslut_figure_path = r'D:\Michel\DAStatFormer\results_figure'
-path_mat = r'D:\Michel\Gated Transformer 论文IJCAI版\DAS_DataNorm_24_features_selected.mat' #r'D:\Michel\DAStatFormer\DAS_DataNorm_all_domains_for_GTN.mat'
-test_interval = 5
-draw_key = 1
-file_name = Path(path_mat).name.split('.')[0]
+def evaluate_and_plot_confusion_matrix(model, dataloader, device, class_labels, save_path, file_name,
+                                       background_index=0):
+    all_preds, all_labels = [], []
+    model.eval()
 
-EPOCH = 100
-BATCH_SIZE = 32
-LR = 1e-4
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f'Using device: {DEVICE}')
-
-d_model = 512
-d_hidden = 128
-q = 8; v = 8; h = 8
-N = 8
-dropout = 0.2
-pe = True
-mask = True  # (utilisé dans les Encoders)
-optimizer_name = 'Adam'
-
-# # ====== Data ======
-
-from torch.utils.data import random_split, DataLoader
-
-
-base_train_ds = MyDataset(path_mat, 'train')
-test_dataset  = MyDataset(path_mat, 'test')
-
-
-n_total = len(base_train_ds)
-n_val   = int(0.1 * n_total)
-n_train = n_total - n_val
-
-train_dataset, val_dataset = random_split(
-    base_train_ds,
-    [n_train, n_val],
-    generator=torch.Generator().manual_seed(42)
-)
-
-# 3) DataLoaders
-train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_dataloader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False)
-test_dataloader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False)
-
-# 4) Métadonnées (prendre sur le dataset de base, pas sur le Subset)
-DATA_LEN  = len(train_dataset)                # au lieu de base_train_ds.train_len
-d_input   = base_train_ds.input_len
-d_channel = base_train_ds.channel_len
-d_output  = base_train_ds.output_len
-
-
-# ====== Déduction L,F & choix RAW+DIFF ======
-xb, yb = next(iter(train_dataloader))
-
-if xb.shape[2] < xb.shape[1]:
-    
-    xb = xb.transpose(1, 2)
-
-L_detect, F_detect = xb.shape[1], xb.shape[2]
-USE_DIFF = (F_detect >= 48)
-
-print(f"Using normalized shape: L={L_detect}, F={F_detect}")
-
-
-if USE_DIFF:
-    time_idx = (0, 14)
-    wave_idx = (14, 26)
-    spec_idx = (26, 48)
-else:
-    # 24 features = 7 (temp) + 6 (wave) + 11 (spec)
-    time_idx = (0, 7)
-    wave_idx = (7, 13)
-    spec_idx = (13, 24)
-
-t0, t1 = time_idx
-w0, w1 = wave_idx
-s0, s1 = spec_idx
-
-d_temp_in = t1 - t0
-d_wave_in = w1 - w0
-d_spec_in = s1 - s0
-
-
-core = GTNParallel3(
-    d_temp=d_temp_in, d_wave=d_wave_in, d_spec=d_spec_in,
-    d_input_L=L_detect,
-    d_model=d_model, d_hidden=d_hidden, q=q, v=v, h=h, N=N,
-    dropout=dropout, device=DEVICE, d_output=d_output, pe=pe
-).to(DEVICE)
-
-net = DASDomainWrapper(
-    core_3branch=core,
-    time_idx=time_idx, wave_idx=wave_idx, spec_idx=spec_idx,
-    diff_offset=24, use_diff=USE_DIFF
-).to(DEVICE)
-
-print(f"[Model] L={L_detect}, F={F_detect}, use_diff={USE_DIFF} "
-      f"-> d_temp={d_temp_in}, d_wave={d_wave_in}, d_spec={d_spec_in}")
-with torch.no_grad():
-    xb, yb = next(iter(train_dataloader))
-    logits, *_ = net(xb.to(DEVICE), 'test')
-    print("OK forward:", tuple(logits.shape))  # (B, num_classes)
-
-# ====== Loss & Optim ======
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(net.parameters(), lr=LR) if optimizer_name == 'Adam' else optim.Adagrad(net.parameters(), lr=LR)
-
-# ====== Suivi ======
-correct_on_train, correct_on_test, loss_list = [], [], []
-
-def test(dataloader, flag='test_set'):
-    correct = 0; total = 0
-    net.eval()
     with torch.no_grad():
-        for x, y in dataloader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            logits, *_ = net(x, 'test')
-            pred = logits.argmax(dim=1)
-            total += y.size(0)
-            correct += (pred == y).sum().item()
-    acc = round(100.0 * correct / max(total, 1), 2)
-    if flag == 'test_set': correct_on_test.append(acc)
-    elif flag == 'train_set': correct_on_train.append(acc)
-    print(f'Accuracy on {flag}: {acc:.2f} %')
-    return acc
+        for x_time, x_wave, x_spec, y in dataloader:
+            x_time = x_time.to(device)
+            x_wave = x_wave.to(device)
+            x_spec = x_spec.to(device)
+            y = y.to(device)
 
-# ====== Train (progress par EPOCH seulement) ======
-def train():
-    total_params = sum(p.numel() for p in net.parameters())
-    trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print("\n📊 ==== Model Summary ====\n")
-    print(f"🔍 Total parameters       : {total_params:,}")
+            y_pre, *_ = model(x_time, x_wave, x_spec, 'test')
+            preds = y_pre.argmax(dim=1).cpu().numpy()
+            labels = y.cpu().numpy()
+
+            all_preds.extend(preds)
+            all_labels.extend(labels)
+
+    C = confusion_matrix(all_labels, all_preds, labels=list(range(len(class_labels))))
+    df = pd.DataFrame(C, index=class_labels, columns=class_labels)
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(df, fmt='g', annot=True, cmap='Reds',
+                xticklabels=class_labels,
+                yticklabels=class_labels,
+                annot_kws={"size": 12})
+    plt.xlabel('Predicted label', fontsize=14)
+    plt.ylabel('True label', fontsize=14)
+    plt.xticks(rotation=0, fontsize=12)
+    plt.yticks(rotation=90, fontsize=12)
+    plt.tight_layout()
+
+    os.makedirs(save_path, exist_ok=True)
+    plt.savefig(os.path.join(save_path, f"{file_name}_Conf_Max.png"), dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
+
+    print("\n===== Performance Metrics =====")
+    acc = np.trace(C) / np.sum(C) if np.sum(C) != 0 else 0.0
+    print(f'Accuracy: {acc:.4f}')
+
+    bg = background_index
+    if C.shape[0] > 1:
+        nar_den = np.sum(C[:, [j for j in range(C.shape[1]) if j != bg]])
+        nar = (np.sum(C[bg, :]) - C[bg, bg]) / nar_den if nar_den != 0 else 0.0
+
+        fnr_den = np.sum(C[[i for i in range(C.shape[0]) if i != bg], :])
+        fnr = (np.sum(C[:, bg]) - C[bg, bg]) / fnr_den if fnr_den != 0 else 0.0
+
+        print(f'NAR: {nar:.4f}')
+        print(f'FNR: {fnr:.4f}')
+
+    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='macro', zero_division=0
+    )
+    print(f'Macro Precision: {precision_macro:.4f}')
+    print(f'Macro Recall:    {recall_macro:.4f}')
+    print(f'Macro F1-score:  {f1_macro:.4f}')
+
+    column_sum = np.sum(C, axis=0)
+    row_sum = np.sum(C, axis=1)
+
+    for i in range(len(class_labels)):
+        TP = C[i, i]
+        precision = TP / column_sum[i] if column_sum[i] != 0 else 0.0
+        recall = TP / row_sum[i] if row_sum[i] != 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) != 0 else 0.0
+
+        print(f'\nClass {class_labels[i]}')
+        print(f'Precision: {precision:.3f}')
+        print(f'Recall:    {recall:.3f}')
+        print(f'F1-score:  {f1:.3f}')
+
+
+def measure_inference_time(model, dataloader, device, n_warmup=5):
+    model.eval()
+    times = []
+    total_samples = 0
+
+    with torch.no_grad():
+        for i, (x_time, x_wave, x_spec, _) in enumerate(dataloader):
+            x_time = x_time.to(device)
+            x_wave = x_wave.to(device)
+            x_spec = x_spec.to(device)
+            bs = x_time.size(0)
+
+            if i < n_warmup:
+                _ = model(x_time, x_wave, x_spec, 'test')
+                continue
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = tm.perf_counter()
+
+            _ = model(x_time, x_wave, x_spec, 'test')
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t1 = tm.perf_counter()
+
+            times.append(t1 - t0)
+            total_samples += bs
+
+    total_time = float(np.sum(times)) if len(times) else 0.0
+    avg_time_per_sample = (total_time / max(total_samples, 1)) * 1000.0
+    print(f"\n⚡ Inference time per sample: {avg_time_per_sample:.4f} ms\n")
+    return avg_time_per_sample
+
+
+def count_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n🔍 Total parameters       : {total_params:,}")
     print(f"🧠 Trainable parameters   : {trainable_params:,}")
     print(f"💾 Estimated model size   : {trainable_params * 4 / 1024 ** 2:.2f} MB (float32)\n")
+
+
+# =========================================================
+# Train
+# =========================================================
+def train(net, train_dataloader, val_dataloader, test_dataloader,
+          DEVICE, EPOCH, test_interval, BATCH_SIZE,
+          reslut_figure_path, save_path, file_name,
+          criterion, optimizer,
+          d_model, q, v, h, N, dropout, DATA_LEN, draw_key,
+          optimizer_name, LR, pe, mask):
+
+    print("\n📊 ==== Model Summary ====")
+    count_parameters(net)
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    net.train()
-    max_accuracy = 0.0
     begin = time()
+    max_accuracy = -1.0
 
-    # buffers pour courbes
     train_losses_plot, val_losses_plot = [], []
     train_acc_plot, val_acc_plot = [], []
 
+    correct_on_train, correct_on_test = [], []
+    loss_list = []
+
+    best_model_dir = r'D:\Michel\DAStatFormer_3domains_mat\saved_model'
+    os.makedirs(best_model_dir, exist_ok=True)
+
     for epoch in range(EPOCH):
         net.train()
-        epoch_loss, batch_count = 0.0, 0
+        epoch_loss = 0.0
+        batch_count = 0
 
-        # --- boucle TRAIN sans tqdm par batch ---
-        for x, y in train_dataloader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            optimizer.zero_grad(set_to_none=True)
-            logits, *_ = net(x, 'train')
-            loss = criterion(logits, y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            optimizer.step()
+        with tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{EPOCH}", unit="batch") as tepoch:
+            for x_time, x_wave, x_spec, y in tepoch:
+                x_time = x_time.to(DEVICE)
+                x_wave = x_wave.to(DEVICE)
+                x_spec = x_spec.to(DEVICE)
+                y = y.to(DEVICE)
 
-            epoch_loss += loss.item()
-            batch_count += 1
+                optimizer.zero_grad()
+                y_pre, *_ = net(x_time, x_wave, x_spec, 'train')
+                loss = criterion(y_pre, y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                batch_count += 1
+                tepoch.set_postfix({"loss": f"{loss.item():.4f}"})
 
         mean_loss = epoch_loss / max(batch_count, 1)
         loss_list.append(mean_loss)
-        print(f"Epoch {epoch+1}/{EPOCH} | Train Loss = {mean_loss:.4f}")
-        
-        
+        print(f"Epoch {epoch+1}: Mean Loss = {mean_loss:.4f}")
+
         tr_loss_ep, tr_acc_ep = evaluate_loss_acc(net, train_dataloader, DEVICE, criterion, desc="train")
         va_loss_ep, va_acc_ep = evaluate_loss_acc(net, val_dataloader, DEVICE, criterion, desc="valid")
-        # ...
+
+        train_losses_plot.append(tr_loss_ep)
+        val_losses_plot.append(va_loss_ep)
+        train_acc_plot.append(tr_acc_ep / 100.0)
+        val_acc_plot.append(va_acc_ep / 100.0)
+
+        correct_on_train.append(tr_acc_ep)
+        correct_on_test.append(va_acc_ep)
+
         if (epoch + 1) % test_interval == 0:
-            current_accuracy = va_acc_ep   # validation accuracy, pas test
-            if current_accuracy > max_accuracy:
-                max_accuracy = current_accuracy
-                os.makedirs('D:/Michel/DAStatFormer/saved_model_3para', exist_ok=True)
-                torch.save(net, f'D:/Michel/DAStatFormer/saved_model/{file_name} batch={BATCH_SIZE}.pkl')
+            if va_acc_ep > max_accuracy:
+                max_accuracy = va_acc_ep
+                torch.save(net.state_dict(), os.path.join(best_model_dir, f'{file_name}_best.pkl'))
 
-        # # Évaluations rapides (pour courbes)
-        # tr_loss_ep, tr_acc_ep = evaluate_loss_acc(net, train_dataloader, DEVICE, criterion, desc="train")
-        # va_loss_ep, va_acc_ep = evaluate_loss_acc(net, test_dataloader,  DEVICE, criterion, desc="valid")
-        # train_losses_plot.append(tr_loss_ep); val_losses_plot.append(va_loss_ep)
-        # train_acc_plot.append(tr_acc_ep/100.0); val_acc_plot.append(va_acc_ep/100.0)
-
-        # # test périodique
-        # if (epoch + 1) % test_interval == 0:
-        #     current_accuracy = test(test_dataloader, 'test_set')
-        #     test(train_dataloader, 'train_set')
-        #     print(f"Max Accuracy so far — Test: {max(correct_on_test)}% | Train: {max(correct_on_train)}%")
-        #     if current_accuracy > max_accuracy:
-        #         max_accuracy = current_accuracy
-        #         os.makedirs('D:/Michel/DAStatFormer/saved_model', exist_ok=True)
-        #         torch.save(net, f'D:/Michel/DAStatFormer/saved_model/{file_name} batch={BATCH_SIZE}.pkl')
-
-    # rename best
     try:
-        os.replace(f'D:/Michel/DAStatFormer/saved_model/{file_name} batch={BATCH_SIZE}.pkl',
-                   f'D:/Michel/DAStatFormer/saved_model/{file_name} {max_accuracy:.2f}% batch={BATCH_SIZE}.pkl')
+        src = os.path.join(best_model_dir, f'{file_name}_best.pkl')
+        dst = os.path.join(best_model_dir, f'{file_name}_best_{max_accuracy:.2f}%_batch={BATCH_SIZE}.pkl')
+        if os.path.exists(src):
+            os.rename(src, dst)
+            print(f"[OK] Renamed best model -> {dst}")
+        else:
+            print(f"[⚠️ rename skipped] Source not found: {src}")
     except Exception as e:
-        print(f"[rename failed] {e}")
+        print(f"[⚠️ os.rename failed] {e}")
 
-    time_cost = round((time() - begin) / 60, 2)
-    print(f"\nTraining completed in {time_cost} min.")
+    end = time()
+    time_cost = round((end - begin) / 60, 2)
+    print(f"\n⏱️ Training completed in {time_cost} min.")
 
     if torch.cuda.is_available():
         max_alloc = torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2
         max_reserv = torch.cuda.max_memory_reserved(DEVICE) / 1024 ** 2
-        print(f"Max GPU Memory Allocated: {max_alloc:.2f} MB")
-        print(f"Max GPU Memory Reserved : {max_reserv:.2f} MB")
-
-    # Courbes finales
-    try:
-        final_png = os.path.join(reslut_figure_path, f"{file_name}_loss_acc.png")
-        draw_loss_acc(train_acc_plot, train_losses_plot, val_acc_plot, val_losses_plot, final_png)
-        print(f"[OK] Courbes loss/acc sauvegardées : {final_png}")
-    except Exception as e:
-        print(f"[final plot failed] {e}")
-
-    # Confusion + métriques
+        print(f"📈 Max GPU Memory Allocated: {max_alloc:.2f} MB")
+        print(f"📦 Max GPU Memory Reserved : {max_reserv:.2f} MB")
 
     evaluate_and_plot_confusion_matrix(
         model=net,
         dataloader=test_dataloader,
         device=DEVICE,
-        class_labels=['background', 'digging', 'knocking', 'watering', 'shaking', 'walking'],save_path=reslut_figure_path, file_name=file_name,
+        class_labels=[str(i) for i in range(net.output_layer.out_features)],
+        save_path=save_path,
+        file_name=file_name,
+        background_index=0
     )
-    
+
     avg_infer_time_ms = measure_inference_time(net, test_dataloader, DEVICE)
     print(f"Average inference time per sample: {avg_infer_time_ms:.3f} ms")
 
-    # Visualisation (votre utilitaire)
     result_visualization(
-        loss_list=loss_list,
+        loss_list_train=train_losses_plot,
+        loss_list_val=val_losses_plot,
         correct_on_test=correct_on_test,
         correct_on_train=correct_on_train,
         test_interval=test_interval,
@@ -539,46 +621,99 @@ def train():
         optimizer_name=optimizer_name, LR=LR, pe=pe, mask=mask
     )
 
-import time as tm
 
-def measure_inference_time(model, dataloader, device, n_warmup=5):
-    """
-    Measure the average inference time per sample (in milliseconds).
-    - n_warmup: nombre d’itérations ignorées pour stabiliser le GPU.
-    """
-    model.eval()
-    times = []
-    total_samples = 0
+# =========================================================
+# Launch
+# =========================================================
+if __name__ == '__main__':
+    setup_seed(30)
+
+    reslut_figure_path = r'D:\Michel\DAStatFormer_3domains_mat\results_figure'
+    save_path = r'D:\Michel\DAStatFormer_3domains_mat\results_confusion_matrix'
+
+    path = r'D:\Michel\Gated Transformer 论文IJCAI版\DAS_DataNorm_24_features_selected.mat'
+    file_name = path.split('\\')[-1].split('.')[0]
+
+    EPOCH = 100
+    BATCH_SIZE = 32
+    LR = 1e-4
+    DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f'Using device: {DEVICE}')
+
+    # Je conseille de commencer plus petit que ton ancien script
+    d_model = 256
+    d_hidden = 128
+    q = 8
+    v = 8
+    h = 8
+    N = 8
+    dropout = 0.2
+    pe = True
+    mask = True
+    optimizer_name = 'AdamW'
+    test_interval = 5
+    draw_key = 1
+
+    base_train_ds = MyDataset3Domains(path, 'train')
+    test_dataset = MyDataset3Domains(path, 'test')
+
+    n_total = len(base_train_ds)
+    n_val = int(0.1 * n_total)
+    n_train = n_total - n_val
+
+    train_dataset, val_dataset = random_split(
+        base_train_ds, [n_train, n_val],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    DATA_LEN = len(train_dataset)
+    
+    x_time0, x_wave0, x_spec0, y0 = base_train_ds[0]
+    
+    d_input = x_time0.shape[0]   # longueur réelle L
+    d_output = base_train_ds.output_len
+    
+    d_temp = x_time0.shape[1]
+    d_wave = x_wave0.shape[1]
+    d_spec = x_spec0.shape[1]
+
+    print(f"[Data] L={d_input}, d_temp={d_temp}, d_wave={d_wave}, d_spec={d_spec}, classes={d_output}")
+
+    net = GTNParallel3Domains(
+        d_temp=d_temp,
+        d_wave=d_wave,
+        d_spec=d_spec,
+        d_input_L=d_input,
+        d_model=d_model,
+        d_hidden=d_hidden,
+        q=q, v=v, h=h, N=N,
+        dropout=dropout,
+        device=DEVICE,
+        d_output=d_output,
+        pe=pe,
+        mask=mask
+    ).to(DEVICE)
 
     with torch.no_grad():
-        # Boucle principale
-        for i, (x, _) in enumerate(dataloader):
-            x = x.to(device)
-            batch_size = x.size(0)
+        xb_time, xb_wave, xb_spec, yb = next(iter(train_dataloader))
+        logits, *_ = net(
+            xb_time.to(DEVICE),
+            xb_wave.to(DEVICE),
+            xb_spec.to(DEVICE),
+            'test'
+        )
+        print("OK forward:", tuple(logits.shape))
 
-            
-            if i < n_warmup:
-                _ = model(x, 'test')
-                continue
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(net.parameters(), lr=LR)
 
-            start_time = tm.perf_counter()
-            _ = model(x, 'test')
-            end_time = tm.perf_counter()
-
-            elapsed = end_time - start_time
-            times.append(elapsed)
-            total_samples += batch_size
-
-    
-    total_time = np.sum(times)
-    avg_time_per_batch = total_time / len(times)
-    avg_time_per_sample = (total_time / total_samples) * 1000  # en ms
-
-    print(f"\n Inference time per batch:   {avg_time_per_batch:.4f} s")
-    print(f" Inference time per sample: {avg_time_per_sample:.4f} ms\n")
-
-    return avg_time_per_sample
-
-
-if __name__ == '__main__':
-    train()
+    train(net, train_dataloader, val_dataloader, test_dataloader,
+          DEVICE, EPOCH, test_interval, BATCH_SIZE,
+          reslut_figure_path, save_path, file_name,
+          criterion, optimizer,
+          d_model, q, v, h, N, dropout, DATA_LEN, draw_key,
+          optimizer_name, LR, pe, mask)
