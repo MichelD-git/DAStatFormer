@@ -14,7 +14,7 @@ DAStatFormer combines:
 
 to achieve **accurate, scalable, and interpretable classification** of DAS events while drastically reducing computational cost compared to raw-signal-based approaches.
 
-This code accompanies a paper submitted to **ICPR 2026**.
+This code accompanies a paper accepted at **ICPR 2026**.
 
 ---
 
